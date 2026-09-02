@@ -11,7 +11,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-MODEL = "llama-3.3-70b-versatile"  # model gratis di Groq, kuat buat coding
+MODEL = "openai/gpt-oss-120b"  # model gratis di Groq, kuat buat coding
 
 SYSTEM_PROMPT = (
     "Kamu adalah asisten coding yang membantu di server Discord. "
