@@ -1,4 +1,7 @@
 import os
+import re
+import json
+import requests
 import discord
 from discord.ext import commands
 from groq import Groq
@@ -8,6 +11,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -16,6 +20,32 @@ VISION_MODEL = "qwen/qwen3.6-27b"  # model gratis di Groq yang bisa baca gambar
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
+# Definisi tool "web_search" yang bisa dipanggil model kalau butuh info terkini
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Cari informasi terkini di internet. Gunakan ini kalau user menanyakan "
+                "sesuatu yang butuh data real-time atau terbaru, seperti kurs mata uang, "
+                "harga, berita, cuaca, skor pertandingan, jadwal, atau fakta yang mungkin "
+                "sudah berubah sejak data training kamu."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Kata kunci pencarian yang singkat dan spesifik.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
+
 SYSTEM_PROMPT = (
     "Kamu adalah asisten pribadi yang membantu di server Discord, dengan keahlian khusus di coding. "
     "Jawab pertanyaan secara langsung dan natural sesuai apa yang ditanya. "
@@ -23,6 +53,11 @@ SYSTEM_PROMPT = (
     "biasa/langsung — JANGAN membuatkan kode kecuali user secara eksplisit minta kode/script/program. "
     "Kalau user memang minta bantuan coding atau minta kode, baru gunakan code block markdown "
     "(```bahasa\\nkode\\n```). "
+    "Kamu punya akses ke tool web_search untuk mencari info terkini (kurs, harga, berita, cuaca, "
+    "jadwal, dan hal lain yang bisa berubah dari waktu ke waktu). Gunakan tool ini setiap kali "
+    "pertanyaan butuh data terbaru atau kamu tidak yakin datamu masih akurat. "
+    "Setelah dapat hasil pencarian, rangkum dan jawab berdasarkan hasil itu, sebutkan singkat "
+    "kalau info ini dari pencarian terbaru. "
     "Gunakan bahasa Indonesia kecuali diminta bahasa lain."
 )
 
@@ -42,20 +77,88 @@ def get_history(channel_id):
     return conversation_history[channel_id]
 
 
+def strip_thinking(text):
+    """Buang blok <think>...</think> yang kadang muncul dari model reasoning."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def web_search(query, max_results=4):
+    """Cari info terkini pakai Tavily API. Return ringkasan hasil sebagai teks."""
+    if not TAVILY_API_KEY:
+        return "Web search tidak tersedia (TAVILY_API_KEY belum diset)."
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": max_results,
+                "include_answer": True,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return f"Pencarian gagal: {e}"
+
+    parts = []
+    if data.get("answer"):
+        parts.append(f"Ringkasan: {data['answer']}")
+
+    for r in data.get("results", [])[:max_results]:
+        title = r.get("title", "")
+        content = r.get("content", "")[:400]
+        url = r.get("url", "")
+        parts.append(f"- {title}: {content} (sumber: {url})")
+
+    return "\n".join(parts) if parts else "Tidak ada hasil ditemukan."
+
+
+def run_with_tools(messages, model):
+    """Jalankan chat completion dengan dukungan tool calling (web_search), loop sampai selesai."""
+    for _ in range(4):  # batas maksimal 4 kali panggil tool berturut-turut, cegah infinite loop
+        response = groq_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.7,
+            max_tokens=1500,
+        )
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            return strip_thinking(msg.content or "")
+
+        # Model minta panggil tool → jalankan lalu kirim hasilnya balik
+        messages.append(msg)
+        for tool_call in msg.tool_calls:
+            if tool_call.function.name == "web_search":
+                args = json.loads(tool_call.function.arguments)
+                result = web_search(args.get("query", ""))
+            else:
+                result = "Tool tidak dikenali."
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+    return "Maaf, terlalu banyak pencarian dibutuhkan untuk menjawab ini."
+
+
 def ask_ai(channel_id, user_message):
     history = get_history(channel_id)
     history.append({"role": "user", "content": user_message})
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-MAX_HISTORY:]
 
-    response = groq_client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=1500,
-    )
-
-    reply = response.choices[0].message.content
+    reply = run_with_tools(messages, MODEL)
     history.append({"role": "assistant", "content": reply})
     return reply
 
@@ -80,7 +183,7 @@ def ask_ai_with_image(channel_id, user_message, image_urls):
         max_tokens=1500,
     )
 
-    reply = response.choices[0].message.content
+    reply = strip_thinking(response.choices[0].message.content)
 
     # Simpan versi teks saja ke history (model vision tidak perlu history gambar lama)
     history.append({"role": "user", "content": user_message or "[gambar]"})
@@ -171,6 +274,7 @@ async def help_command(ctx):
         "- `!reset` — reset history percakapan di channel ini\n"
         "- Chat lewat DM juga bisa langsung tanpa mention\n"
         "- Attach gambar bareng mention untuk tanya soal gambar (screenshot error, diagram, dll)\n"
+        "- Bisa cari info terkini otomatis (kurs, harga, berita, cuaca) lewat web search\n"
     )
     await ctx.reply(text)
 
