@@ -3,6 +3,7 @@ import re
 import json
 import requests
 import discord
+from datetime import datetime, timedelta, timezone
 from discord.ext import commands
 from groq import Groq
 from dotenv import load_dotenv
@@ -58,11 +59,16 @@ SYSTEM_PROMPT = (
     "pertanyaan butuh data terbaru atau kamu tidak yakin datamu masih akurat. "
     "Setelah dapat hasil pencarian, rangkum dan jawab berdasarkan hasil itu, sebutkan singkat "
     "kalau info ini dari pencarian terbaru. "
+    "Kamu tidak punya akses untuk melihat riwayat aktivitas atau pesan user lain secara langsung "
+    "lewat percakapan biasa. Kalau user bertanya soal aktivitas/riwayat chat orang lain di server "
+    "(misal 'apa saja yang dilakukan si X'), arahkan mereka untuk pakai command "
+    "`!activity @nama_user` yang bisa merangkum aktivitas chat user tersebut. "
     "Gunakan bahasa Indonesia kecuali diminta bahasa lain."
 )
 
 intents = discord.Intents.default()
 intents.message_content = True  # WAJIB diaktifkan juga di Developer Portal
+intents.members = True  # WAJIB diaktifkan juga di Developer Portal, untuk fitur !activity
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -205,6 +211,35 @@ def split_message(text, limit=2000):
     return chunks
 
 
+async def collect_user_activity(guild, target_user, days=7, max_messages_per_channel=300):
+    """Scan pesan dari target_user di semua text channel yang bisa diakses bot,
+    dalam rentang `days` hari terakhir. Return list of {channel, content, timestamp}."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    collected = []
+
+    for channel in guild.text_channels:
+        # Skip channel yang bot gak punya izin baca
+        perms = channel.permissions_for(guild.me)
+        if not perms.read_message_history or not perms.view_channel:
+            continue
+
+        try:
+            async for msg in channel.history(limit=max_messages_per_channel, after=since):
+                if msg.author.id == target_user.id and not msg.author.bot:
+                    collected.append({
+                        "channel": channel.name,
+                        "content": msg.content,
+                        "timestamp": msg.created_at,
+                    })
+        except discord.Forbidden:
+            continue
+        except Exception:
+            continue
+
+    collected.sort(key=lambda x: x["timestamp"])
+    return collected
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Bot aktif sebagai {bot.user}")
@@ -265,6 +300,64 @@ async def reset_command(ctx):
     await ctx.reply("🔄 History percakapan direset!")
 
 
+@bot.command(name="activity")
+async def activity_command(ctx, member: discord.Member, days: int = 7):
+    """Contoh: !activity @user 7 — rangkum aktivitas chat user dalam N hari terakhir (default 7)"""
+    if days < 1 or days > 30:
+        await ctx.reply("Rentang hari harus antara 1-30.")
+        return
+
+    async with ctx.typing():
+        await ctx.reply(f"🔍 Mengumpulkan aktivitas **{member.display_name}** dalam {days} hari terakhir...")
+
+        messages = await collect_user_activity(ctx.guild, member, days=days)
+
+        if not messages:
+            await ctx.reply(
+                f"Tidak ditemukan pesan dari **{member.display_name}** dalam {days} hari terakhir "
+                f"(di channel yang bisa aku akses)."
+            )
+            return
+
+        # Susun jadi teks ringkas buat dirangkum AI, batasi jumlah pesan biar gak kepanjangan
+        log_lines = []
+        for m in messages[-200:]:  # ambil maksimal 200 pesan terakhir biar gak overload
+            ts = m["timestamp"].strftime("%d/%m %H:%M")
+            content = m["content"][:200] if m["content"] else "[tanpa teks / attachment]"
+            log_lines.append(f"[{ts}] #{m['channel']}: {content}")
+
+        log_text = "\n".join(log_lines)
+
+        summary_prompt = (
+            f"Berikut adalah log pesan dari user '{member.display_name}' di server Discord "
+            f"selama {days} hari terakhir ({len(messages)} pesan total). "
+            f"Tolong rangkum aktivitas/topik yang dia bahas, pola waktu aktif, dan channel yang "
+            f"paling sering dipakai. Jawab ringkas dalam poin-poin.\n\n{log_text}"
+        )
+
+        try:
+            messages_payload = [
+                {"role": "system", "content": "Kamu adalah asisten yang merangkum log chat menjadi ringkasan yang jelas dan ringkas."},
+                {"role": "user", "content": summary_prompt},
+            ]
+            reply = run_with_tools(messages_payload, MODEL)
+            reply = f"📊 **Ringkasan aktivitas {member.display_name} ({days} hari terakhir, {len(messages)} pesan):**\n\n{reply}"
+            for chunk in split_message(reply):
+                await ctx.reply(chunk)
+        except Exception as e:
+            await ctx.reply(f"⚠️ Gagal merangkum: `{e}`")
+
+
+@activity_command.error
+async def activity_command_error(ctx, error):
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.reply("User tidak ditemukan. Pastikan kamu mention user-nya dengan benar, contoh: `!activity @nama_user`")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply("Format: `!activity @user [jumlah_hari]`, contoh: `!activity @budi 7`")
+    else:
+        await ctx.reply(f"⚠️ Error: `{error}`")
+
+
 @bot.command(name="help_asisten")
 async def help_command(ctx):
     text = (
@@ -275,6 +368,7 @@ async def help_command(ctx):
         "- Chat lewat DM juga bisa langsung tanpa mention\n"
         "- Attach gambar bareng mention untuk tanya soal gambar (screenshot error, diagram, dll)\n"
         "- Bisa cari info terkini otomatis (kurs, harga, berita, cuaca) lewat web search\n"
+        "- `!activity @user [jumlah_hari]` — rangkum aktivitas chat user (default 7 hari)\n"
     )
     await ctx.reply(text)
 
